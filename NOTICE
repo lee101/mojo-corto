@@ -1,0 +1,10 @@
+mojo-corto
+
+This repository is a source-derived Mojo port of compute kernels from corto:
+https://github.com/cnr-isti-vclab/corto
+
+Corto copyright (c) 2015-2022, Visual Computing Lab, ISTI - CNR.
+The ported C++ source files state GNU Lesser General Public License version 3
+or later. The upstream repository's top-level LICENSE.txt separately states
+the MIT License, and its README describes the C++ code as GPL. This derived
+port follows the more restrictive source-file terms, LGPL-3.0-or-later.

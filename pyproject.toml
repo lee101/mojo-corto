@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mojo-corto"
+version = "0.1.0"
+description = "Mojo ports of corto geometry-compression kernels"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "LGPL-3.0-or-later"
+dependencies = ["numpy"]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
