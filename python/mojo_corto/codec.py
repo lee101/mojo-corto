@@ -58,23 +58,24 @@ def quantize(
     )
     if offsets.size != components:
         raise ValueError("offset must have one value per component")
-    if not np.all(np.isfinite(source)) or not np.all(np.isfinite(offsets)):
+    if not np.all(np.isfinite(offsets)):
         raise ValueError("values and offset must be finite")
-    with np.errstate(over="ignore", invalid="ignore"):
-        scaled = (source - offsets) / q32
-    limits = np.iinfo(np.int32)
-    if np.any(scaled < limits.min) or np.any(scaled > limits.max):
-        raise OverflowError("quantized values do not fit in int32")
     target = np.empty(source.shape, dtype=np.int32)
     if source.shape[0]:
-        lib().corto_quantize_f32(
+        statuses = np.empty(7, dtype=np.int32)
+        status = lib().corto_quantize_f32(
             address(source),
             address(target),
             source.shape[0],
             components,
             q32,
             address(offsets),
+            address(statuses),
         )
+        if status == 1:
+            raise ValueError("values and offset must be finite")
+        if status == 2:
+            raise OverflowError("quantized values do not fit in int32")
     return target
 
 

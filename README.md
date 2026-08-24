@@ -92,7 +92,7 @@ the upstream checkout contains no expected-value unit suite for these
 functions. Tests therefore use source-derived NumPy/Python references plus
 mesh invariants.
 
-The 40 tests assert exact quantized values, packed words, probability tables,
+The 41 tests assert exact quantized values, packed words, probability tables,
 entropy round trips, CLERS reconstruction, triangle and edge multiplicities,
 Euler characteristic, watertightness, quantization error, normal angle bounds,
 end-to-end attribute prediction, malformed native stream rejection, and unsafe
@@ -135,19 +135,20 @@ is a practical baseline, not equal work.
 
 | Kernel | Mojo | Reference | Speedup | Reference |
 |---|---:|---:|---:|---|
-| quantize f32, 2M x 3 | 51.967 ms | 49.152 ms | 0.95x | NumPy |
-| octa encode, 1.5M | 11.830 ms | 232.713 ms | 19.67x | NumPy |
-| correlated bit-pack, 250K x 3 | 16.498 ms | 1518.917 ms | 92.07x | Python port |
-| Tunstall decode, 2MB | 2.423 ms | 241.496 ms | 99.66x | Python port |
-| connectivity, 178802 faces | 106.236 ms | 752.757 ms | 7.09x | NumPy edge incidence |
+| quantize f32, 2M x 3 | 25.639 ms | 31.847 ms | 1.24x | NumPy |
+| octa encode, 1.5M | 8.537 ms | 180.209 ms | 21.11x | NumPy |
+| correlated bit-pack, 250K x 3 | 10.875 ms | 1278.399 ms | 117.55x | Python port |
+| Tunstall decode, 2MB | 2.459 ms | 224.629 ms | 91.35x | Python port |
+| connectivity, 178802 faces | 107.011 ms | 695.659 ms | 6.50x | NumPy edge incidence |
 
 The three-component quantizer uses contiguous SIMD blocks with a scalar
-remainder and uses thresholded CPU parallelism for large inputs. Its public API
-also performs finite-value and integer-range validation; the table includes
-that cost.
+remainder and uses thresholded CPU parallelism for large inputs. Finite-value
+and integer-range validation is fused into the same native SIMD pass, avoiding
+a full-size temporary; the table includes that validation cost.
 
-There is no GPU path. These kernels are memory-bound, branch-heavy, or serially
-dependent, so this port targets the CPU.
+There is no GPU path. No kernel has the roughly greater-than-two-flops-per-byte
+arithmetic intensity needed to justify device transfer and launch overhead;
+the kernels are memory-bound, branch-heavy, or serially dependent.
 
 Run the locked benchmark on your machine with:
 

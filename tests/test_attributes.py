@@ -51,6 +51,17 @@ def test_quantization_parallel_path_matches_generic_attr():
     )
 
 
+def test_quantization_parallel_path_reports_validation_errors():
+    values = np.zeros((400_000, 3), dtype=np.float32)
+    values[-1, 0] = np.float32(3e38)
+    with pytest.raises(OverflowError):
+        corto.quantize(values, 1e-20)
+
+    values[-1, 1] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        corto.quantize(values, 1e-20)
+
+
 def test_quantization_step_matches_encoder():
     points = np.array([[-2, 1, 7], [6, 3, -1], [2, -5, 3]], np.float32)
     assert corto.quantization_step(points, 4) == pytest.approx(8 / 16)

@@ -18,7 +18,7 @@ F32 = ctypes.c_float
 
 _SIGNATURES = {
     "corto_parallel_init": ([], I),
-    "corto_quantize_f32": ([I, I, I, I, F32, I], None),
+    "corto_quantize_f32": ([I, I, I, I, F32, I, I], I),
     "corto_dequantize_f32": ([I, I, I, I, F32, I], None),
     "corto_delta_encode": ([I, I, I, I, I, I], None),
     "corto_delta_decode": ([I, I, I, I, I, I], None),

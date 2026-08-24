@@ -2,7 +2,7 @@
 
 from std.algorithm import parallelize
 from std.ffi import external_call
-from std.math import sqrt
+from std.math import isfinite, sqrt
 from std.sys.info import num_physical_cores, simd_width_of as simdwidthof
 
 comptime U8Ptr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
@@ -53,23 +53,33 @@ def corto_quantize_f32(
     components: Int,
     q: Float32,
     offsets_address: Int,
-) abi("C"):
+    status_address: Int,
+) abi("C") -> Int:
     if count <= 0 or components <= 0 or q == 0.0:
-        return
+        return 0
     var source = f32p(source_address)
     var target = i32p(target_address)
     var offsets = f32p(offsets_address)
     var size = count * components
+    for c in range(components):
+        if not isfinite(offsets[c]):
+            return 1
     if components != 3:
         for i in range(count):
             for c in range(components):
-                target[i * components + c] = Int32(
-                    (source[i * components + c] - offsets[c]) / q
-                )
-        return
+                var value = source[i * components + c]
+                if not isfinite(value):
+                    return 1
+                var scaled = (value - offsets[c]) / q
+                if scaled < -2147483648.0 or scaled >= 2147483648.0:
+                    return 2
+                target[i * components + c] = Int32(scaled)
+        return 0
 
     comptime W = simdwidthof[DType.float64]()
     comptime BLOCK = 3 * W
+    var low = SIMD[DType.float32, W](-2147483648.0)
+    var high = SIMD[DType.float32, W](2147483648.0)
     var workers = min(num_physical_cores(), MAX_QUANTIZE_WORKERS)
     if size < PARALLEL_QUANTIZE_ELEMENTS:
         workers = 1
@@ -79,6 +89,8 @@ def corto_quantize_f32(
         var work_source = f32p(source_address)
         var work_target = i32p(target_address)
         var work_offsets = f32p(offsets_address)
+        var work_status = i32p(status_address)
+        work_status[worker] = 0
         var blocks = size // BLOCK
         var start = (worker * blocks // workers) * BLOCK
         var end = ((worker + 1) * blocks // workers) * BLOCK
@@ -94,35 +106,62 @@ def corto_quantize_f32(
         var divisor = SIMD[DType.float32, W](q)
         var i = start
         while i + BLOCK <= end:
-            work_target.store(
-                i,
-                ((work_source.load[width=W](i) - offset0) / divisor).cast[
-                    DType.int32
-                ](),
-            )
-            work_target.store(
-                i + W,
-                (
-                    (work_source.load[width=W](i + W) - offset1) / divisor
-                ).cast[DType.int32](),
-            )
-            work_target.store(
-                i + 2 * W,
-                (
-                    (work_source.load[width=W](i + 2 * W) - offset2) / divisor
-                ).cast[DType.int32](),
-            )
+            var values0 = work_source.load[width=W](i)
+            if not isfinite(values0).reduce_and():
+                work_status[worker] = 1
+            else:
+                var scaled0 = (values0 - offset0) / divisor
+                if scaled0.lt(low).reduce_or() or scaled0.ge(high).reduce_or():
+                    if work_status[worker] == 0:
+                        work_status[worker] = 2
+                else:
+                    work_target.store(i, scaled0.cast[DType.int32]())
+            var values1 = work_source.load[width=W](i + W)
+            if not isfinite(values1).reduce_and():
+                work_status[worker] = 1
+            else:
+                var scaled1 = (values1 - offset1) / divisor
+                if scaled1.lt(low).reduce_or() or scaled1.ge(high).reduce_or():
+                    if work_status[worker] == 0:
+                        work_status[worker] = 2
+                else:
+                    work_target.store(i + W, scaled1.cast[DType.int32]())
+            var values2 = work_source.load[width=W](i + 2 * W)
+            if not isfinite(values2).reduce_and():
+                work_status[worker] = 1
+            else:
+                var scaled2 = (values2 - offset2) / divisor
+                if scaled2.lt(low).reduce_or() or scaled2.ge(high).reduce_or():
+                    if work_status[worker] == 0:
+                        work_status[worker] = 2
+                else:
+                    work_target.store(i + 2 * W, scaled2.cast[DType.int32]())
             i += BLOCK
         while i < end:
-            work_target[i] = Int32(
-                (work_source[i] - work_offsets[i % 3]) / q
-            )
+            var value = work_source[i]
+            if not isfinite(value):
+                work_status[worker] = 1
+            else:
+                var scaled = (value - work_offsets[i % 3]) / q
+                if scaled < -2147483648.0 or scaled >= 2147483648.0:
+                    if work_status[worker] == 0:
+                        work_status[worker] = 2
+                else:
+                    work_target[i] = Int32(scaled)
             i += 1
 
     if workers > 1:
         parallelize[process](workers, workers)
     else:
         process(0)
+    var statuses = i32p(status_address)
+    for worker in range(workers):
+        if statuses[worker] == 1:
+            return 1
+    for worker in range(workers):
+        if statuses[worker] == 2:
+            return 2
+    return 0
 
 
 # corto: include/corto/vertex_attribute.h GenericAttr::dequantize
