@@ -1,6 +1,5 @@
 """Compute kernels ported from corto's mesh and point-cloud codec."""
 
-from std.algorithm import parallelize
 from std.ffi import external_call
 from std.math import isfinite, sqrt
 from std.sys.info import num_physical_cores, simd_width_of as simdwidthof
@@ -84,13 +83,7 @@ def corto_quantize_f32(
     if size < PARALLEL_QUANTIZE_ELEMENTS:
         workers = 1
 
-    @parameter
-    def process(worker: Int):
-        var work_source = f32p(source_address)
-        var work_target = i32p(target_address)
-        var work_offsets = f32p(offsets_address)
-        var work_status = i32p(status_address)
-        work_status[worker] = 0
+    for worker in range(workers):
         var blocks = size // BLOCK
         var start = (worker * blocks // workers) * BLOCK
         var end = ((worker + 1) * blocks // workers) * BLOCK
@@ -100,60 +93,57 @@ def corto_quantize_f32(
         var offset1 = SIMD[DType.float32, W](0.0)
         var offset2 = SIMD[DType.float32, W](0.0)
         for lane in range(W):
-            offset0[lane] = work_offsets[lane % 3]
-            offset1[lane] = work_offsets[(lane + W) % 3]
-            offset2[lane] = work_offsets[(lane + 2 * W) % 3]
+            offset0[lane] = offsets[lane % 3]
+            offset1[lane] = offsets[(lane + W) % 3]
+            offset2[lane] = offsets[(lane + 2 * W) % 3]
         var divisor = SIMD[DType.float32, W](q)
+        var status = i32p(status_address)
+        status[worker] = 0
         var i = start
         while i + BLOCK <= end:
-            var values0 = work_source.load[width=W](i)
+            var values0 = source.load[width=W](i)
             if not isfinite(values0).reduce_and():
-                work_status[worker] = 1
+                status[worker] = 1
             else:
                 var scaled0 = (values0 - offset0) / divisor
                 if scaled0.lt(low).reduce_or() or scaled0.ge(high).reduce_or():
-                    if work_status[worker] == 0:
-                        work_status[worker] = 2
+                    if status[worker] == 0:
+                        status[worker] = 2
                 else:
-                    work_target.store(i, scaled0.cast[DType.int32]())
-            var values1 = work_source.load[width=W](i + W)
+                    target.store(i, scaled0.cast[DType.int32]())
+            var values1 = source.load[width=W](i + W)
             if not isfinite(values1).reduce_and():
-                work_status[worker] = 1
+                status[worker] = 1
             else:
                 var scaled1 = (values1 - offset1) / divisor
                 if scaled1.lt(low).reduce_or() or scaled1.ge(high).reduce_or():
-                    if work_status[worker] == 0:
-                        work_status[worker] = 2
+                    if status[worker] == 0:
+                        status[worker] = 2
                 else:
-                    work_target.store(i + W, scaled1.cast[DType.int32]())
-            var values2 = work_source.load[width=W](i + 2 * W)
+                    target.store(i + W, scaled1.cast[DType.int32]())
+            var values2 = source.load[width=W](i + 2 * W)
             if not isfinite(values2).reduce_and():
-                work_status[worker] = 1
+                status[worker] = 1
             else:
                 var scaled2 = (values2 - offset2) / divisor
                 if scaled2.lt(low).reduce_or() or scaled2.ge(high).reduce_or():
-                    if work_status[worker] == 0:
-                        work_status[worker] = 2
+                    if status[worker] == 0:
+                        status[worker] = 2
                 else:
-                    work_target.store(i + 2 * W, scaled2.cast[DType.int32]())
+                    target.store(i + 2 * W, scaled2.cast[DType.int32]())
             i += BLOCK
         while i < end:
-            var value = work_source[i]
+            var value = source[i]
             if not isfinite(value):
-                work_status[worker] = 1
+                status[worker] = 1
             else:
-                var scaled = (value - work_offsets[i % 3]) / q
+                var scaled = (value - offsets[i % 3]) / q
                 if scaled < -2147483648.0 or scaled >= 2147483648.0:
-                    if work_status[worker] == 0:
-                        work_status[worker] = 2
+                    if status[worker] == 0:
+                        status[worker] = 2
                 else:
-                    work_target[i] = Int32(scaled)
+                    target[i] = Int32(scaled)
             i += 1
-
-    if workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        process(0)
     var statuses = i32p(status_address)
     for worker in range(workers):
         if statuses[worker] == 1:
