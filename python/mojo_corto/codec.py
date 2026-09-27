@@ -62,7 +62,7 @@ def quantize(
         raise ValueError("values and offset must be finite")
     target = np.empty(source.shape, dtype=np.int32)
     if source.shape[0]:
-        statuses = np.empty(7, dtype=np.int32)
+        statuses = np.empty(16, dtype=np.int32)
         status = lib().corto_quantize_f32(
             address(source),
             address(target),
@@ -530,21 +530,13 @@ def encode_connectivity(faces, vertex_count: int | None = None) -> Connectivity:
     edges = face_count * 3
     opposite_face = np.empty(edges, dtype=np.int32)
     opposite_side = np.empty(edges, dtype=np.int32)
-    edge_v0 = np.empty(edges, dtype=np.uint32)
-    edge_v1 = np.empty(edges, dtype=np.uint32)
-    edge_face = np.empty(edges, dtype=np.int32)
-    edge_side = np.empty(edges, dtype=np.uint8)
-    edge_inverted = np.empty(edges, dtype=np.uint8)
+    edge_records = np.empty(2 * edges, dtype=np.uint64)
     lib().corto_build_topology(
         address(clean),
         face_count,
         address(opposite_face),
         address(opposite_side),
-        address(edge_v0),
-        address(edge_v1),
-        address(edge_face),
-        address(edge_side),
-        address(edge_inverted),
+        address(edge_records),
     )
 
     front_capacity = edges + 3

@@ -1,5 +1,6 @@
 """Compute kernels ported from corto's mesh and point-cloud codec."""
 
+from max.algorithm import parallelize
 from std.ffi import external_call
 from std.math import isfinite, sqrt
 from std.sys.info import num_physical_cores, simd_width_of as simdwidthof
@@ -7,10 +8,13 @@ from std.sys.info import num_physical_cores, simd_width_of as simdwidthof
 comptime U8Ptr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime I32Ptr = UnsafePointer[Int32, AnyOrigin[mut=True]]
 comptime U32Ptr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
-comptime F32Ptr = UnsafePointer[Float32, AnyOrigin[mut=True]]
 comptime I64Ptr = UnsafePointer[Int64, AnyOrigin[mut=True]]
-comptime PARALLEL_QUANTIZE_ELEMENTS = 1_048_576
-comptime MAX_QUANTIZE_WORKERS = 7
+comptime F32Ptr = UnsafePointer[Float32, AnyOrigin[mut=True]]
+comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
+comptime PARALLEL_QUANTIZE_ELEMENTS = 262_144
+comptime MAX_QUANTIZE_WORKERS = 8
+comptime QW = simdwidthof[DType.float32]()
+comptime QBLOCK = 3 * QW
 
 
 @always_inline
@@ -38,9 +42,76 @@ def i64p(address: Int) -> I64Ptr:
     return I64Ptr(unsafe_from_address=address)
 
 
+@always_inline
+def u64p(address: Int) -> U64Ptr:
+    return U64Ptr(unsafe_from_address=address)
+
+
 @export("corto_parallel_init")
 def corto_parallel_init() abi("C") -> Int:
     return external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+
+
+def quantize_run(
+    slot: Int,
+    status_address: Int,
+    source: F32Ptr,
+    target: I32Ptr,
+    offsets: F32Ptr,
+    q: Float32,
+    start: Int,
+    end: Int,
+):
+    var o0 = SIMD[DType.float32, QW](0.0)
+    var o1 = SIMD[DType.float32, QW](0.0)
+    var o2 = SIMD[DType.float32, QW](0.0)
+    for lane in range(QW):
+        o0[lane] = offsets[lane % 3]
+        o1[lane] = offsets[(lane + QW) % 3]
+        o2[lane] = offsets[(lane + 2 * QW) % 3]
+    var divisor = SIMD[DType.float32, QW](q)
+    var limit = SIMD[DType.float32, QW](2147483648.0)
+    var nan_flag = 0
+    var range_flag = 0
+    var i = start
+    while i + QBLOCK <= end:
+        var v0 = source.unsafe_load[width=QW](i)
+        var v1 = source.unsafe_load[width=QW](i + QW)
+        var v2 = source.unsafe_load[width=QW](i + 2 * QW)
+        var s0 = (v0 - o0) / divisor
+        var s1 = (v1 - o1) / divisor
+        var s2 = (v2 - o2) / divisor
+        target.store(i, s0.cast[DType.int32]())
+        target.store(i + QW, s1.cast[DType.int32]())
+        target.store(i + 2 * QW, s2.cast[DType.int32]())
+        if not (
+            abs(s0).lt(limit).reduce_and()
+            and abs(s1).lt(limit).reduce_and()
+            and abs(s2).lt(limit).reduce_and()
+        ):
+            if not (
+                isfinite(v0).reduce_and()
+                and isfinite(v1).reduce_and()
+                and isfinite(v2).reduce_and()
+            ):
+                nan_flag = 1
+            else:
+                range_flag = 1
+        i += QBLOCK
+    while i < end:
+        var value = source.unsafe_load(i)
+        if not isfinite(value):
+            nan_flag = 1
+        else:
+            var scaled = (value - offsets[i % 3]) / q
+            if scaled < -2147483648.0 or scaled >= 2147483648.0:
+                range_flag = 1
+            else:
+                target.unsafe_store(i, Int32(scaled))
+        i += 1
+    var status = i32p(status_address)
+    status[slot] = Int32(nan_flag)
+    status[MAX_QUANTIZE_WORKERS + slot] = Int32(range_flag)
 
 
 # corto: include/corto/vertex_attribute.h GenericAttr::quantize
@@ -75,83 +146,45 @@ def corto_quantize_f32(
                 target[i * components + c] = Int32(scaled)
         return 0
 
-    comptime W = simdwidthof[DType.float64]()
-    comptime BLOCK = 3 * W
-    var low = SIMD[DType.float32, W](-2147483648.0)
-    var high = SIMD[DType.float32, W](2147483648.0)
+    var status = i32p(status_address)
     var workers = min(num_physical_cores(), MAX_QUANTIZE_WORKERS)
-    if size < PARALLEL_QUANTIZE_ELEMENTS:
+    if size < PARALLEL_QUANTIZE_ELEMENTS or workers > size // QBLOCK:
         workers = 1
-
-    for worker in range(workers):
-        var blocks = size // BLOCK
-        var start = (worker * blocks // workers) * BLOCK
-        var end = ((worker + 1) * blocks // workers) * BLOCK
-        if worker == workers - 1:
-            end = size
-        var offset0 = SIMD[DType.float32, W](0.0)
-        var offset1 = SIMD[DType.float32, W](0.0)
-        var offset2 = SIMD[DType.float32, W](0.0)
-        for lane in range(W):
-            offset0[lane] = offsets[lane % 3]
-            offset1[lane] = offsets[(lane + W) % 3]
-            offset2[lane] = offsets[(lane + 2 * W) % 3]
-        var divisor = SIMD[DType.float32, W](q)
-        var status = i32p(status_address)
-        status[worker] = 0
-        var i = start
-        while i + BLOCK <= end:
-            var values0 = source.load[width=W](i)
-            if not isfinite(values0).reduce_and():
-                status[worker] = 1
-            else:
-                var scaled0 = (values0 - offset0) / divisor
-                if scaled0.lt(low).reduce_or() or scaled0.ge(high).reduce_or():
-                    if status[worker] == 0:
-                        status[worker] = 2
-                else:
-                    target.store(i, scaled0.cast[DType.int32]())
-            var values1 = source.load[width=W](i + W)
-            if not isfinite(values1).reduce_and():
-                status[worker] = 1
-            else:
-                var scaled1 = (values1 - offset1) / divisor
-                if scaled1.lt(low).reduce_or() or scaled1.ge(high).reduce_or():
-                    if status[worker] == 0:
-                        status[worker] = 2
-                else:
-                    target.store(i + W, scaled1.cast[DType.int32]())
-            var values2 = source.load[width=W](i + 2 * W)
-            if not isfinite(values2).reduce_and():
-                status[worker] = 1
-            else:
-                var scaled2 = (values2 - offset2) / divisor
-                if scaled2.lt(low).reduce_or() or scaled2.ge(high).reduce_or():
-                    if status[worker] == 0:
-                        status[worker] = 2
-                else:
-                    target.store(i + 2 * W, scaled2.cast[DType.int32]())
-            i += BLOCK
-        while i < end:
-            var value = source[i]
-            if not isfinite(value):
-                status[worker] = 1
-            else:
-                var scaled = (value - offsets[i % 3]) / q
-                if scaled < -2147483648.0 or scaled >= 2147483648.0:
-                    if status[worker] == 0:
-                        status[worker] = 2
-                else:
-                    target[i] = Int32(scaled)
-            i += 1
-    var statuses = i32p(status_address)
-    for worker in range(workers):
-        if statuses[worker] == 1:
+        quantize_run(0, status_address, source, target, offsets, q, 0, size)
+    else:
+        var chunks = size // QBLOCK
+        quantize_run_chunks(
+            chunks, status_address, source, target, offsets, q, size, workers
+        )
+    for slot in range(workers):
+        if status[slot] == 1:
             return 1
-    for worker in range(workers):
-        if statuses[worker] == 2:
+    for slot in range(workers):
+        if status[MAX_QUANTIZE_WORKERS + slot] == 1:
             return 2
     return 0
+
+
+def quantize_run_chunks(
+    chunks: Int,
+    status_address: Int,
+    source: F32Ptr,
+    target: I32Ptr,
+    offsets: F32Ptr,
+    q: Float32,
+    size: Int,
+    workers: Int,
+):
+    def work(worker: Int) {imm}:
+        var start = worker * chunks // workers * QBLOCK
+        var end = (worker + 1) * chunks // workers * QBLOCK
+        if worker == workers - 1:
+            end = size
+        quantize_run(
+            worker, status_address, source, target, offsets, q, start, end
+        )
+
+    parallelize(work, workers, workers)
 
 
 # corto: include/corto/vertex_attribute.h GenericAttr::dequantize
@@ -785,58 +818,46 @@ def corto_tunstall_decode(
 
 
 @always_inline
-def edge_less(
-    v0: U32Ptr, v1: U32Ptr, left: Int, right: Int
-) -> Bool:
-    if v0[left] != v0[right]:
-        return v0[left] < v0[right]
-    return v1[left] < v1[right]
-
-
-@always_inline
 def swap_edge(
-    v0: U32Ptr,
-    v1: U32Ptr,
-    face: I32Ptr,
-    side: U8Ptr,
-    inverted: U8Ptr,
+    edges: U64Ptr,
     a: Int,
     b: Int,
 ):
-    var u = v0[a]
-    v0[a] = v0[b]
-    v0[b] = u
-    u = v1[a]
-    v1[a] = v1[b]
-    v1[b] = u
-    var iv = face[a]
-    face[a] = face[b]
-    face[b] = iv
-    var byte = side[a]
-    side[a] = side[b]
-    side[b] = byte
-    byte = inverted[a]
-    inverted[a] = inverted[b]
-    inverted[b] = byte
+    var k = edges[a * 2]
+    edges[a * 2] = edges[b * 2]
+    edges[b * 2] = k
+    var m = edges[a * 2 + 1]
+    edges[a * 2 + 1] = edges[b * 2 + 1]
+    edges[b * 2 + 1] = m
 
 
 def sift_edges(
-    v0: U32Ptr,
-    v1: U32Ptr,
-    face: I32Ptr,
-    side: U8Ptr,
-    inverted: U8Ptr,
+    edges: U64Ptr,
     root: Int,
     end: Int,
 ):
     var current = root
     while current * 2 + 1 <= end:
         var child = current * 2 + 1
-        if child + 1 <= end and edge_less(v0, v1, child, child + 1):
-            child += 1
-        if not edge_less(v0, v1, current, child):
+        var child_key = edges[child * 2]
+        var child_meta = edges[child * 2 + 1]
+        if child + 1 <= end:
+            var right_key = edges[child * 2 + 2]
+            var right_meta = edges[child * 2 + 3]
+            if right_key > child_key or (
+                right_key == child_key and right_meta > child_meta
+            ):
+                child += 1
+                child_key = right_key
+                child_meta = right_meta
+        var current_key = edges[current * 2]
+        var current_meta = edges[current * 2 + 1]
+        if not (
+            current_key < child_key
+            or (current_key == child_key and current_meta < child_meta)
+        ):
             return
-        swap_edge(v0, v1, face, side, inverted, current, child)
+        swap_edge(edges, current, child)
         current = child
 
 
@@ -846,61 +867,54 @@ def build_topology_impl(
     face_count: Int,
     opposite_face: I32Ptr,
     opposite_side: I32Ptr,
-    edge_v0: U32Ptr,
-    edge_v1: U32Ptr,
-    edge_face: I32Ptr,
-    edge_side: U8Ptr,
-    edge_inverted: U8Ptr,
+    edges: U64Ptr,
 ):
     var edge_count = face_count * 3
+    for e in range(edge_count):
+        opposite_face[e] = -1
+        opposite_side[e] = -1
     for f in range(face_count):
+        var a = Int(faces[f * 3 + 1])
+        var b = Int(faces[f * 3 + 2])
         for s in range(3):
-            opposite_face[f * 3 + s] = -1
-            opposite_side[f * 3 + s] = -1
-            var a = Int(faces[f * 3 + ((s + 1) % 3)])
-            var b = Int(faces[f * 3 + ((s + 2) % 3)])
             var e = f * 3 + s
-            edge_face[e] = Int32(f)
-            edge_side[e] = UInt8(s)
-            if a < b:
-                edge_v0[e] = UInt32(a)
-                edge_v1[e] = UInt32(b)
-                edge_inverted[e] = 0
-            else:
-                edge_v0[e] = UInt32(b)
-                edge_v1[e] = UInt32(a)
-                edge_inverted[e] = 1
+            var low = a
+            var high = b
+            var inverted = 0
+            if low >= high:
+                low = b
+                high = a
+                inverted = 1
+            edges[e * 2] = (UInt64(low) << 32) | UInt64(high)
+            edges[e * 2 + 1] = (
+                UInt64(inverted) << 33 | UInt64(f) << 2 | UInt64(s)
+            )
+            a = b
+            b = Int(faces[f * 3 + s])
 
     if edge_count > 1:
         var root = edge_count // 2
         while root > 0:
             root -= 1
-            sift_edges(
-                edge_v0, edge_v1, edge_face, edge_side, edge_inverted,
-                root, edge_count - 1,
-            )
+            sift_edges(edges, root, edge_count - 1)
         var end = edge_count - 1
         while end > 0:
-            swap_edge(
-                edge_v0, edge_v1, edge_face, edge_side, edge_inverted, 0, end
-            )
+            swap_edge(edges, 0, end)
             end -= 1
-            sift_edges(
-                edge_v0, edge_v1, edge_face, edge_side, edge_inverted, 0, end
-            )
+            sift_edges(edges, 0, end)
 
     var previous = -1
+    var previous_key = UInt64(0)
+    var previous_meta = UInt64(0)
     for e in range(edge_count):
-        if (
-            previous >= 0
-            and edge_v0[e] == edge_v0[previous]
-            and edge_v1[e] == edge_v1[previous]
-            and edge_inverted[e] != edge_inverted[previous]
-        ):
-            var f = Int(edge_face[e])
-            var s = Int(edge_side[e])
-            var pf = Int(edge_face[previous])
-            var ps = Int(edge_side[previous])
+        var key = edges[e * 2]
+        var meta = edges[e * 2 + 1]
+        var pairable = previous >= 0 and key == previous_key
+        if pairable and ((meta ^ previous_meta) >> 33) == 1:
+            var f = Int((meta >> 2) & 0x7FFFFFFF)
+            var s = Int(meta & 3)
+            var pf = Int((previous_meta >> 2) & 0x7FFFFFFF)
+            var ps = Int(previous_meta & 3)
             if opposite_face[f * 3 + s] == -1 and opposite_face[pf * 3 + ps] == -1:
                 opposite_face[f * 3 + s] = Int32(pf)
                 opposite_side[f * 3 + s] = Int32(ps)
@@ -908,6 +922,8 @@ def build_topology_impl(
                 opposite_side[pf * 3 + ps] = Int32(s)
         else:
             previous = e
+            previous_key = key
+            previous_meta = meta
 
 
 # corto: src/encoder.cpp buildTopology
@@ -917,11 +933,7 @@ def corto_build_topology(
     face_count: Int,
     opposite_face_address: Int,
     opposite_side_address: Int,
-    edge_v0_address: Int,
-    edge_v1_address: Int,
-    edge_face_address: Int,
-    edge_side_address: Int,
-    edge_inverted_address: Int,
+    edges_address: Int,
 ) abi("C"):
     if face_count <= 0:
         return
@@ -930,13 +942,8 @@ def corto_build_topology(
         face_count,
         i32p(opposite_face_address),
         i32p(opposite_side_address),
-        u32p(edge_v0_address),
-        u32p(edge_v1_address),
-        i32p(edge_face_address),
-        u8p(edge_side_address),
-        u8p(edge_inverted_address),
+        u64p(edges_address),
     )
-
 
 @always_inline
 def front_append(

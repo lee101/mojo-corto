@@ -33,7 +33,7 @@ _SIGNATURES = {
     "corto_tunstall_build": ([I, I, I, I, I, I, I, I, I], I),
     "corto_tunstall_encode": ([I, I, I, I, I, I, I], I),
     "corto_tunstall_decode": ([I, I, I, I, I, I, I, I], I),
-    "corto_build_topology": ([I, I, I, I, I, I, I, I, I], None),
+    "corto_build_topology": ([I, I, I, I, I], None),
     "corto_connectivity_encode": ([I] * 18, I),
     "corto_connectivity_decode": ([I] * 17, I),
 }
